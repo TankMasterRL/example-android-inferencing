@@ -9,6 +9,7 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.util.Log
+import com.edgeimpulse.gattsensors.senml.Senml
 import com.hoho.android.usbserial.driver.UsbSerialPort
 import com.hoho.android.usbserial.driver.UsbSerialProber
 import com.hoho.android.usbserial.util.SerialInputOutputManager
@@ -35,10 +36,15 @@ private const val BAUD_RATE = 115200
  * |--------|---------|---------|
  * | `!`    | Column header (sent once after boot) | `!ax,ay,az` |
  * | `#`    | Comment – ignored | `# starting up` |
+ * | `[` / `{` | SenML JSON pack (RFC 8428), one per line — e.g. an OpenMV board running the senml micropython library (`SenmlPack.to_json()`) | `[{"bn":"openmv:","n":"ax","u":"m/s2","v":0.12}]` |
  * | none   | Data row – comma-separated floats | `0.12,-0.34,9.81` |
  *
  * If no `!` header line is ever received the columns are named
- * `col_0`, `col_1`, … automatically.
+ * `col_0`, `col_1`, … automatically. SenML packs are self-describing:
+ * record names become the column names and record units are carried
+ * through to SenML-format offline logs. Each line type is handled
+ * independently, so a device may mix formats (the most recent line
+ * dictates the column set).
  */
 class UsbSerialClient(
     private val context: Context,
@@ -58,9 +64,13 @@ class UsbSerialClient(
     private val _sampleCount    = MutableStateFlow(0)
     val sampleCount = _sampleCount.asStateFlow()
 
-    /** Column names from the `!header` line, e.g. ["ax","ay","az"]. */
+    /** Column names from the `!header` line or SenML record names, e.g. ["ax","ay","az"]. */
     private val _columnHeaders  = MutableStateFlow<List<String>>(emptyList())
     val columnHeaders = _columnHeaders.asStateFlow()
+
+    /** Per-column units declared by SenML records (null = none declared). */
+    private val _columnUnits    = MutableStateFlow<List<String?>>(emptyList())
+    val columnUnits = _columnUnits.asStateFlow()
 
     /** Most-recent parsed sample — one Float per column. */
     private val _lastSample     = MutableStateFlow<FloatArray?>(null)
@@ -209,8 +219,10 @@ class UsbSerialClient(
                 }
                 ch != '\r' -> {
                     lineBuffer.append(ch)
-                    // Guard against a misbehaving device flooding with no newlines
-                    if (lineBuffer.length > 1024) lineBuffer.clear()
+                    // Guard against a misbehaving device flooding with no
+                    // newlines. 4 KiB leaves room for a many-channel SenML
+                    // pack with units and base fields on a single line.
+                    if (lineBuffer.length > 4096) lineBuffer.clear()
                 }
             }
         }
@@ -229,6 +241,13 @@ class UsbSerialClient(
     private fun processLine(line: String) {
         val trimmed = line.trim()
         if (trimmed.isEmpty() || trimmed.startsWith("#")) return
+
+        // SenML JSON pack (RFC 8428) — one pack per line, as emitted by the
+        // senml micropython library on OpenMV boards.
+        if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+            handleSenmlLine(trimmed)
+            return
+        }
 
         // Header declaration: !ax,ay,az[,gx,gy,gz,...]
         if (trimmed.startsWith("!")) {
@@ -256,6 +275,37 @@ class UsbSerialClient(
         val arr = floats.toFloatArray()
         _lastSample.value = arr
         _sampleCount.value = _sampleCount.value + 1
-        scope.launch { dataRepository.saveUsbSensorData(arr) }
+        val names = _columnHeaders.value
+        scope.launch { dataRepository.saveUsbSensorData(arr, names) }
+    }
+
+    /**
+     * Parse one SenML pack into a sample. Record names replace the `!header`
+     * column set while packs keep arriving; a malformed line is dropped and
+     * the stream stays alive (mirrors the bad-CSV behaviour). String/boolean
+     * records are tolerated but only finite numeric values become columns.
+     */
+    private fun handleSenmlLine(line: String) {
+        val resolved = try {
+            Senml.resolve(Senml.fromJson(line))
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Malformed SenML line skipped")
+            return
+        }
+        val numeric = resolved.filter { it.value != null }
+        if (numeric.isEmpty()) return
+
+        val names = numeric.map { it.shortName }
+        val units = numeric.map { it.unit }
+        if (_columnHeaders.value != names) {
+            _columnHeaders.value = names
+            Log.i(TAG, "USB SenML channels: $names")
+        }
+        if (_columnUnits.value != units) _columnUnits.value = units
+
+        val arr = FloatArray(numeric.size) { numeric[it].value!!.toFloat() }
+        _lastSample.value = arr
+        _sampleCount.value = _sampleCount.value + 1
+        scope.launch { dataRepository.saveUsbSensorData(arr, names, units) }
     }
 }

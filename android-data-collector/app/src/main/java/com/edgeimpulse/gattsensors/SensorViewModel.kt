@@ -178,16 +178,19 @@ class SensorViewModel(
         speechRecognitionHelper.startListening()
     }
 
-    fun startOfflineLogging(headers: List<String> = emptyList()) {
-        dataRepository.startOfflineLogging(headers)
+    fun startOfflineLogging(
+        headers: List<String> = emptyList(),
+        format: OfflineLogFormat = OfflineLogFormat.CSV,
+    ) {
+        dataRepository.startOfflineLogging(headers, format)
     }
 
     fun stopOfflineLogging() {
         dataRepository.stopOfflineLogging()
     }
 
-    fun uploadStoredCsvFiles(label: String) {
-        dataRepository.uploadStoredCsvFiles(label)
+    fun uploadStoredLogFiles(label: String) {
+        dataRepository.uploadStoredLogFiles(label)
     }
 
     // ----- On-device dataset management (Datasets tab) -----

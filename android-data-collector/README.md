@@ -113,9 +113,23 @@ The microphone icon in the top-right shows wake-word listener status (green = on
 
 Use this when you have no data connection (e.g. outdoors, factory floor):
 
-1. Enable **Log samples to CSV on device** with the toggle.
-2. Tap **Start** / **Stop** as normal — samples accumulate in a local CSV file.
-3. When back online, enter a label and tap **Upload stored CSV to Edge Impulse** to batch-upload everything.
+1. Enable **Log samples to file on device** with the toggle and pick a **Log format** — plain CSV or SenML (see below).
+2. Tap **Start** / **Stop** as normal — samples accumulate in a local file.
+3. When back online, enter a label and tap **Upload stored data to Edge Impulse** to batch-upload everything.
+
+### SenML support (RFC 8428)
+
+Alongside CSV, the app reads and writes [SenML](https://www.rfc-editor.org/rfc/rfc8428) — the IETF Sensor Measurement Lists format, as produced by e.g. the [`senml` MicroPython library](https://docs.openmv.io/library/senml.html) on OpenMV boards. Unlike bare CSV, SenML records are self-describing: they carry channel names, units, and timestamps.
+
+- **Logging/export:** with the SenML log format selected, offline logs are written as `.senml` files — *line-delimited SenML*, one strictly RFC-compliant JSON pack per line (crash-safe, append-only):
+
+  ```json
+  [{"bn":"a1b2c3d4:","bt":1752130000.123,"n":"accel_0","u":"m/s2","v":0.12},{"n":"accel_1","u":"m/s2","v":-0.34},{"n":"accel_2","u":"m/s2","v":9.81}]
+  ```
+
+  `.senml` datasets can be previewed, renamed, shared (`application/senml+json`) and deleted from the **Datasets** tab like CSVs (the spreadsheet editor stays CSV-only).
+- **Upload:** Edge Impulse ingestion doesn't accept SenML, so stored `.senml` files are converted to the EI data-acquisition JSON at upload time (channel order from the first pack, `interval_ms` derived from record timestamps) and deleted only after a successful upload.
+- **USB serial input:** lines starting with `[` or `{` on the USB OTG serial connection are parsed as SenML packs — record names become column names, units flow through to SenML-format offline logs. An OpenMV/MicroPython board can stream `SenmlPack.to_json()` output directly.
 
 ### Step 8 — Verify data in Edge Impulse Studio
 
@@ -160,6 +174,7 @@ The **USB OTG** tab streams sensor data from any USB serial device — an Arduin
 !ax,ay,az,gx,gy,gz   ← column header, sent once on boot (optional)
 0.12,-0.34,9.81,...  ← data row — comma-separated floats
 # comment            ← ignored
+[{"n":"ax","v":0.12},...]  ← SenML pack (RFC 8428) — alternative to the CSV rows
 ```
 
 **Quick start:**
@@ -252,7 +267,8 @@ flowchart TD
 | Camera JPEG | binary `image/jpeg` | `POST /api/training/data` |
 | Zephyr inference result | JSON `x-label` = inferred class | `POST /api/training/data` |
 | Zephyr raw IMU | buffered CSV → flush on inference | `POST /api/training/data` |
-| USB OTG serial (Arduino / any MCU) | buffered float rows → flush on window close | `POST /api/training/data` |
+| USB OTG serial (Arduino / any MCU) | buffered float rows (CSV or SenML lines) → flush on window close | `POST /api/training/data` |
+| Offline `.senml` logs | line-delimited SenML → converted to `IngestionPayload` JSON on flush | `POST /api/training/data` |
 | EI Studio remote trigger | WebSocket `wss://remote-mgmt.edgeimpulse.com` | stream |
 
 ### Zephyr BLE GATT profile
@@ -284,8 +300,9 @@ flowchart TD
 | `SensorCollector.kt` | Android Sensor API → `SensorData` flow |
 | `CameraHelper.kt` | CameraX → JPEG bytes |
 | `ZephyrBLEClient.kt` | BLE central — scan, connect, parse Zephyr |
-| `UsbSerialClient.kt` | USB OTG serial — auto-detect chip, parse CSV protocol |
-| `DataRepository.kt` | CSV logging + EI HTTPS uploads |
+| `UsbSerialClient.kt` | USB OTG serial — auto-detect chip, parse CSV or SenML line protocol |
+| `DataRepository.kt` | CSV/SenML logging + EI HTTPS uploads |
+| `senml/` | SenML (RFC 8428) model, JSON writer/parser, unit registry, EI conversion |
 | `EdgeImpulseManager.kt` | Remote-mgmt WebSocket client |
 | `GattProfile.kt` | UUIDs shared with firmware |
 | `GattServerManager.kt` | Phone GATT server (WearOS relay) |
@@ -314,7 +331,8 @@ This codebase is intentionally split into small, single-purpose components (`Sen
 
 | You want… | Files to copy / point your agent at |
 |---|---|
-| Phone sensor capture | `SensorCollector.kt`, `IngestionSample.kt`, `DataRepository.kt` (`uploadStoredCsvFiles`, ingestion DTOs) |
+| Phone sensor capture | `SensorCollector.kt`, `IngestionSample.kt`, `DataRepository.kt` (`uploadStoredLogFiles`, ingestion DTOs) |
+| SenML (RFC 8428) read/write | `senml/Senml.kt`, `senml/SenmlUnits.kt`, `senml/SenmlIngestion.kt` |
 | Image capture + EI upload | `CameraHelper.kt`, `DataRepository.uploadImage` |
 | Microphone capture + EI upload | `AudioFileRecorder.kt`, `DataRepository.uploadAudio` |
 | Wear OS sensor relay | `wearosdatalogger/` module, `WearOSClient.kt`, `WearableMessageListenerService.kt`, `WearProtocol.kt` |
