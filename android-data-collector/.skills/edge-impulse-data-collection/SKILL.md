@@ -25,12 +25,12 @@ Wear OS relay, and Zephyr BLE central. New sources follow the same pattern.
   `collectSourceOptions: List<String>` for the UI dropdown, and routes the
   selected option in `startSensorForDuration(sensorType, durationMs)`.
 - `DataRepository.kt` — the **only** place that talks to the EI ingestion API.
-  Offline samples are written via `saveSensorData` — as CSV or line-delimited
-  SenML (RFC 8428) depending on the user's log-format choice — and later
-  flushed with `uploadStoredLogFiles` (SenML files are converted to the EI
-  data-acquisition JSON on flush). SenML rendering/parsing lives in the
-  `senml/` package. Images use `uploadImage`, audio uses `uploadAudio`.
-  Do not add a new HTTP client.
+  Offline samples are written via `saveSensorData` — as CSV, line-delimited
+  SenML JSON, or a SenML CBOR sequence (RFC 8428) depending on the user's
+  log-format choice — and later flushed with `uploadStoredLogFiles` (SenML
+  files are converted to the EI data-acquisition JSON on flush). SenML
+  rendering/parsing lives in the `senml/` package. Images use `uploadImage`,
+  audio uses `uploadAudio`. Do not add a new HTTP client.
 - `MainActivity.kt` — Compose UI. The Collect screen reads
   `viewModel.collectSourceOptions` for its dropdown and calls
   `viewModel.startSensorForDuration(...)`. Runtime permissions are declared in

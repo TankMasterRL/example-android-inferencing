@@ -64,7 +64,11 @@ fun DatasetsScreen(viewModel: SensorViewModel) {
             val authority = context.packageName + ".fileprovider"
             val uri = FileProvider.getUriForFile(context, authority, ds.file)
             val intent = Intent(Intent.ACTION_SEND).apply {
-                type = if (ds.file.extension == "senml") "application/senml+json" else "text/csv"
+                type = when (ds.file.extension) {
+                    "senml"  -> "application/senml+json"
+                    "senmlc" -> "application/senml+cbor"
+                    else     -> "text/csv"
+                }
                 putExtra(Intent.EXTRA_STREAM, uri)
                 putExtra(Intent.EXTRA_SUBJECT, ds.name)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -195,7 +199,7 @@ fun DatasetsScreen(viewModel: SensorViewModel) {
             text = {
                 Column {
                     Text(
-                        if (ds.file.extension == "senml")
+                        if (ds.file.extension.startsWith("senml"))
                             "Converts \"${ds.name}\" to the Edge Impulse data-acquisition " +
                                 "format and sends it to /api/training/data with the chosen label."
                         else

@@ -128,8 +128,9 @@ Alongside CSV, the app reads and writes [SenML](https://www.rfc-editor.org/rfc/r
   ```
 
   `.senml` datasets can be previewed, renamed, shared (`application/senml+json`) and deleted from the **Datasets** tab like CSVs (the spreadsheet editor stays CSV-only).
-- **Upload:** Edge Impulse ingestion doesn't accept SenML, so stored `.senml` files are converted to the EI data-acquisition JSON at upload time (channel order from the first pack, `interval_ms` derived from record timestamps) and deleted only after a successful upload.
-- **USB serial input:** lines starting with `[` or `{` on the USB OTG serial connection are parsed as SenML packs — record names become column names, units flow through to SenML-format offline logs. An OpenMV/MicroPython board can stream `SenmlPack.to_json()` output directly.
+- **CBOR:** the binary SenML representation (RFC 8428 §6, `application/senml+cbor`) is available as a third log format, "SenML CBOR". Logs are written as `.senmlc` files — a CBOR *sequence* of packs, one per sample, keyed by the RFC's integer labels — the compact binary analog of the JSON-lines layout with the same crash-safety. `.senmlc` datasets preview (rendered as JSON), share, and upload like `.senml` ones.
+- **Upload:** Edge Impulse ingestion doesn't accept SenML, so stored `.senml`/`.senmlc` files are converted to the EI data-acquisition JSON at upload time (channel order from the first pack, `interval_ms` derived from record timestamps) and deleted only after a successful upload.
+- **USB serial input:** lines starting with `[` or `{` on the USB OTG serial connection are parsed as SenML packs — record names become column names, units flow through to SenML-format offline logs. An OpenMV/MicroPython board can stream `SenmlPack.to_json()` output directly. CBOR is *not* supported over serial: the wire protocol is newline-framed ASCII, and binary CBOR (which can contain `\n` bytes) doesn't fit that framing — use `to_json()` on the device instead.
 
 ### Step 8 — Verify data in Edge Impulse Studio
 
@@ -268,7 +269,7 @@ flowchart TD
 | Zephyr inference result | JSON `x-label` = inferred class | `POST /api/training/data` |
 | Zephyr raw IMU | buffered CSV → flush on inference | `POST /api/training/data` |
 | USB OTG serial (Arduino / any MCU) | buffered float rows (CSV or SenML lines) → flush on window close | `POST /api/training/data` |
-| Offline `.senml` logs | line-delimited SenML → converted to `IngestionPayload` JSON on flush | `POST /api/training/data` |
+| Offline `.senml` / `.senmlc` logs | line-delimited SenML JSON / CBOR sequence → converted to `IngestionPayload` JSON on flush | `POST /api/training/data` |
 | EI Studio remote trigger | WebSocket `wss://remote-mgmt.edgeimpulse.com` | stream |
 
 ### Zephyr BLE GATT profile
@@ -302,7 +303,7 @@ flowchart TD
 | `ZephyrBLEClient.kt` | BLE central — scan, connect, parse Zephyr |
 | `UsbSerialClient.kt` | USB OTG serial — auto-detect chip, parse CSV or SenML line protocol |
 | `DataRepository.kt` | CSV/SenML logging + EI HTTPS uploads |
-| `senml/` | SenML (RFC 8428) model, JSON writer/parser, unit registry, EI conversion |
+| `senml/` | SenML (RFC 8428) model, JSON + CBOR writer/parser, unit registry, EI conversion |
 | `EdgeImpulseManager.kt` | Remote-mgmt WebSocket client |
 | `GattProfile.kt` | UUIDs shared with firmware |
 | `GattServerManager.kt` | Phone GATT server (WearOS relay) |
@@ -332,7 +333,7 @@ This codebase is intentionally split into small, single-purpose components (`Sen
 | You want… | Files to copy / point your agent at |
 |---|---|
 | Phone sensor capture | `SensorCollector.kt`, `IngestionSample.kt`, `DataRepository.kt` (`uploadStoredLogFiles`, ingestion DTOs) |
-| SenML (RFC 8428) read/write | `senml/Senml.kt`, `senml/SenmlUnits.kt`, `senml/SenmlIngestion.kt` |
+| SenML (RFC 8428) read/write | `senml/Senml.kt`, `senml/SenmlCbor.kt`, `senml/SenmlUnits.kt`, `senml/SenmlIngestion.kt` |
 | Image capture + EI upload | `CameraHelper.kt`, `DataRepository.uploadImage` |
 | Microphone capture + EI upload | `AudioFileRecorder.kt`, `DataRepository.uploadAudio` |
 | Wear OS sensor relay | `wearosdatalogger/` module, `WearOSClient.kt`, `WearableMessageListenerService.kt`, `WearProtocol.kt` |

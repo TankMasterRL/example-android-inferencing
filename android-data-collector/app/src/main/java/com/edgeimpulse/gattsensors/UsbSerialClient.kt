@@ -44,7 +44,9 @@ private const val BAUD_RATE = 115200
  * record names become the column names and record units are carried
  * through to SenML-format offline logs. Each line type is handled
  * independently, so a device may mix formats (the most recent line
- * dictates the column set).
+ * dictates the column set). Only the JSON representation is accepted —
+ * binary SenML CBOR can contain `\n` bytes and doesn't fit this
+ * newline-framed ASCII protocol.
  */
 class UsbSerialClient(
     private val context: Context,

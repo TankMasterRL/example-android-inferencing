@@ -756,8 +756,9 @@ fun CollectScreen(viewModel: SensorViewModel, cameraHelper: CameraHelper) {
         item {
             var formatOpen by remember { mutableStateOf(false) }
             val formatLabels = mapOf(
-                OfflineLogFormat.CSV   to "CSV",
-                OfflineLogFormat.SENML to "SenML (RFC 8428)",
+                OfflineLogFormat.CSV        to "CSV",
+                OfflineLogFormat.SENML      to "SenML (RFC 8428)",
+                OfflineLogFormat.SENML_CBOR to "SenML CBOR",
             )
             ExposedDropdownMenuBox(
                 expanded = formatOpen,

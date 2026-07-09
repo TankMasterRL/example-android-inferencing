@@ -90,6 +90,9 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0")
 
+    // SenML CBOR representation (RFC 8428 §6)
+    implementation("co.nstant.in:cbor:0.9")
+
     // CameraX
     implementation("androidx.camera:camera-camera2:1.3.3")
     implementation("androidx.camera:camera-lifecycle:1.3.3")
