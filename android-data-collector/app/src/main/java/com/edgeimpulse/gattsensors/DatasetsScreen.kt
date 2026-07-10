@@ -64,7 +64,11 @@ fun DatasetsScreen(viewModel: SensorViewModel) {
             val authority = context.packageName + ".fileprovider"
             val uri = FileProvider.getUriForFile(context, authority, ds.file)
             val intent = Intent(Intent.ACTION_SEND).apply {
-                type = "text/csv"
+                type = when (ds.file.extension) {
+                    "senml"  -> "application/senml+json"
+                    "senmlc" -> "application/senml+cbor"
+                    else     -> "text/csv"
+                }
                 putExtra(Intent.EXTRA_STREAM, uri)
                 putExtra(Intent.EXTRA_SUBJECT, ds.name)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -83,7 +87,7 @@ fun DatasetsScreen(viewModel: SensorViewModel) {
                 Text("On-device datasets",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold)
-                Text("Browse, edit and upload locally-recorded CSV samples.",
+                Text("Browse, edit and upload locally-recorded samples (CSV or SenML).",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
             }
@@ -105,7 +109,7 @@ fun DatasetsScreen(viewModel: SensorViewModel) {
                         modifier = Modifier.size(48.dp),
                         tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f))
                     Spacer(Modifier.height(8.dp))
-                    Text("No local CSVs yet.",
+                    Text("No local datasets yet.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
                     Text("Enable \"Offline logging\" on the Collect tab to record.",
@@ -135,7 +139,7 @@ fun DatasetsScreen(viewModel: SensorViewModel) {
 
     // ── Rename ─────────────────────────────────────────────────────────
     renameTarget?.let { ds ->
-        var newName by remember(ds) { mutableStateOf(ds.name.removeSuffix(".csv")) }
+        var newName by remember(ds) { mutableStateOf(ds.name.removeSuffix(".${ds.file.extension}")) }
         AlertDialog(
             onDismissRequest = { renameTarget = null },
             title = { Text("Rename dataset") },
@@ -194,7 +198,12 @@ fun DatasetsScreen(viewModel: SensorViewModel) {
             title = { Text("Upload to Edge Impulse") },
             text = {
                 Column {
-                    Text("Sends \"${ds.name}\" to /api/training/files with the chosen label.",
+                    Text(
+                        if (ds.file.extension.startsWith("senml"))
+                            "Converts \"${ds.name}\" to the Edge Impulse data-acquisition " +
+                                "format and sends it to /api/training/data with the chosen label."
+                        else
+                            "Sends \"${ds.name}\" to /api/training/files with the chosen label.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
                     Spacer(Modifier.height(8.dp))
@@ -309,9 +318,12 @@ private fun DatasetCard(
                 IconButton(onClick = onPreview) {
                     Icon(Icons.Default.Visibility, contentDescription = "Preview")
                 }
-                IconButton(onClick = onEdit) {
-                    Icon(Icons.Default.GridOn, contentDescription = "Edit as spreadsheet",
-                        tint = MaterialTheme.colorScheme.primary)
+                // The spreadsheet editor splits rows on commas — CSV only.
+                if (ds.file.extension == "csv") {
+                    IconButton(onClick = onEdit) {
+                        Icon(Icons.Default.GridOn, contentDescription = "Edit as spreadsheet",
+                            tint = MaterialTheme.colorScheme.primary)
+                    }
                 }
                 IconButton(onClick = onRename) {
                     Icon(Icons.Default.Edit, contentDescription = "Rename")

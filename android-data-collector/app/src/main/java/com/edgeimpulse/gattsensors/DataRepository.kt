@@ -3,6 +3,11 @@ package com.edgeimpulse.gattsensors
 import android.content.Context
 import android.provider.Settings
 import android.util.Log
+import com.edgeimpulse.gattsensors.senml.Senml
+import com.edgeimpulse.gattsensors.senml.SenmlCbor
+import com.edgeimpulse.gattsensors.senml.SenmlIngestion
+import com.edgeimpulse.gattsensors.senml.SenmlRecord
+import com.edgeimpulse.gattsensors.senml.SenmlUnits
 import com.google.android.gms.wearable.MessageEvent
 import com.google.gson.Gson
 import kotlinx.coroutines.CoroutineScope
@@ -14,7 +19,9 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.BufferedOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.FileWriter
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -23,6 +30,14 @@ import java.util.*
 data class IngestionRequest(val protected: Protected, val payload: IngestionPayload)
 data class Protected(val ver: String, val alg: String, val signature: String)
 data class IngestionPayload(val device_name: String, val device_type: String, val interval_ms: Number, val sensors: List<SensorInfo>, val values: List<List<Float>>)
+
+/**
+ * On-device offline logging format: classic CSV rows; line-delimited SenML
+ * (RFC 8428) where each line is one self-describing JSON pack carrying channel
+ * names, units and timestamps; or the binary SenML CBOR representation
+ * (RFC 8428 §6) written as a CBOR sequence of packs.
+ */
+enum class OfflineLogFormat { CSV, SENML, SENML_CBOR }
 
 /** Metadata for one on-device CSV dataset shown in the Datasets tab. */
 data class StoredDataset(
@@ -59,9 +74,13 @@ class DataRepository(private val context: Context, private val apiKeyStore: ApiK
             ?: "android-ei-device"
     }
 
-    // For offline logging
+    // For offline logging. Text formats (CSV, SenML JSON) write through
+    // logFileWriter; the binary SenML CBOR format writes through
+    // logOutputStream — exactly one of the two is open while logging.
     private var isLoggingOffline = false
-    private var csvFileWriter: FileWriter? = null
+    private var offlineFormat = OfflineLogFormat.CSV
+    private var logFileWriter: FileWriter? = null
+    private var logOutputStream: BufferedOutputStream? = null
     private var offlineHeaders: List<String> = emptyList()
     // When true, the header row is written from the first sample's actual
     // value keys rather than the caller-provided default. This avoids
@@ -74,23 +93,40 @@ class DataRepository(private val context: Context, private val apiKeyStore: ApiK
     private val remoteSampleData = mutableListOf<SensorData>()
     private var isSamplingForRemote = false
 
-    fun startOfflineLogging(headers: List<String> = emptyList()) {
+    fun startOfflineLogging(
+        headers: List<String> = emptyList(),
+        format: OfflineLogFormat = OfflineLogFormat.CSV,
+    ) {
         if (isLoggingOffline) return
         isLoggingOffline = true
-        offlineHeadersDeferred = headers.isEmpty()
-        offlineHeaders = if (offlineHeadersDeferred) listOf("timestamp")
-                         else listOf("timestamp") + headers
+        offlineFormat = format
+        // SenML lines are self-describing, so the CSV header machinery only
+        // applies to the CSV format.
+        offlineHeadersDeferred = format == OfflineLogFormat.CSV && headers.isEmpty()
+        offlineHeaders = if (format == OfflineLogFormat.CSV && !offlineHeadersDeferred)
+                             listOf("timestamp") + headers
+                         else listOf("timestamp")
         val dir = File(context.getExternalFilesDir(null), "sensor_logs")
         if (!dir.exists()) dir.mkdirs()
-        val file = File(dir, "sensor_data_${getDateString()}.csv")
+        val ext = when (format) {
+            OfflineLogFormat.CSV        -> "csv"
+            OfflineLogFormat.SENML      -> "senml"
+            OfflineLogFormat.SENML_CBOR -> "senmlc"
+        }
+        val file = File(dir, "sensor_data_${getDateString()}.$ext")
         try {
-            csvFileWriter = FileWriter(file)
-            if (!offlineHeadersDeferred) {
-                csvFileWriter?.append(offlineHeaders.joinToString(",") + "\n")
+            if (format == OfflineLogFormat.SENML_CBOR) {
+                logOutputStream = BufferedOutputStream(FileOutputStream(file))
+            } else {
+                logFileWriter = FileWriter(file)
+                if (format == OfflineLogFormat.CSV && !offlineHeadersDeferred) {
+                    logFileWriter?.append(offlineHeaders.joinToString(",") + "\n")
+                }
             }
         } catch (e: IOException) {
-            Log.e("DataRepository", "Error creating CSV file", e)
-            csvFileWriter = null
+            Log.e("DataRepository", "Error creating log file", e)
+            logFileWriter = null
+            logOutputStream = null
             isLoggingOffline = false
         }
     }
@@ -99,33 +135,99 @@ class DataRepository(private val context: Context, private val apiKeyStore: ApiK
         if (!isLoggingOffline) return
         isLoggingOffline = false
         try {
-            csvFileWriter?.flush()
-            csvFileWriter?.close()
+            logFileWriter?.flush()
+            logFileWriter?.close()
+            logOutputStream?.flush()
+            logOutputStream?.close()
         } catch (e: IOException) {
-            Log.e("DataRepository", "Error closing CSV file", e)
+            Log.e("DataRepository", "Error closing log file", e)
         }
-        csvFileWriter = null
+        logFileWriter = null
+        logOutputStream = null
     }
 
-    // Flush CSV every N writes so an app crash doesn't lose buffered data.
-    private var csvWriteCount = 0
-    private val csvFlushInterval = 20
+    // Flush the log every N writes so an app crash doesn't lose buffered data.
+    private var logWriteCount = 0
+    private val logFlushInterval = 20
+
+    /** Append one line to the offline log, honouring the periodic flush. */
+    private fun appendOfflineLine(line: String) {
+        try {
+            logFileWriter?.append(line)?.append('\n')
+            if (++logWriteCount % logFlushInterval == 0) {
+                logFileWriter?.flush()
+            }
+        } catch (e: IOException) {
+            Log.e("DataRepository", "Error writing to log file", e)
+        }
+    }
+
+    /**
+     * Append one SenML pack in the active format: a JSON line (`.senml`) or
+     * a CBOR-encoded item appended to the CBOR sequence (`.senmlc`).
+     */
+    private fun appendOfflineSenmlPack(records: List<SenmlRecord>) {
+        if (records.isEmpty()) return
+        if (offlineFormat == OfflineLogFormat.SENML_CBOR) {
+            try {
+                logOutputStream?.write(SenmlCbor.encodePack(records))
+                if (++logWriteCount % logFlushInterval == 0) {
+                    logOutputStream?.flush()
+                }
+            } catch (e: Exception) {
+                Log.e("DataRepository", "Error writing to CBOR log file", e)
+            }
+        } else {
+            appendOfflineLine(Senml.toJson(records))
+        }
+    }
+
+    /**
+     * Append one sample as a SenML pack: `bn` = this device, `bt` =
+     * phone-clock epoch seconds, one record per channel with units from
+     * [SenmlUnits] (device-declared [units] win when provided).
+     */
+    private fun appendOfflineSenmlSample(
+        timestampMs: Long,
+        names: List<String>,
+        values: FloatArray,
+        units: List<String?>? = null,
+    ) {
+        val records = mutableListOf<SenmlRecord>()
+        var basesPending = true
+        for (i in values.indices) {
+            val v = values[i]
+            if (!v.isFinite()) continue
+            val name = names.getOrNull(i) ?: "col_$i"
+            records.add(SenmlRecord(
+                bn = if (basesPending) "$deviceId:" else null,
+                bt = if (basesPending) timestampMs / 1000.0 else null,
+                n  = name,
+                u  = units?.getOrNull(i) ?: SenmlUnits.unitFor(name),
+                v  = v.toString().toDouble(),
+            ))
+            basesPending = false
+        }
+        appendOfflineSenmlPack(records)
+    }
 
     fun saveSensorData(data: SensorData) {
         if (isLoggingOffline) {
-            try {
+            if (offlineFormat != OfflineLogFormat.CSV) {
+                appendOfflineSenmlPack(Senml.packFromSensorData(deviceId, listOf(data)))
+            } else try {
                 // Lazily fix the header row to whatever the first real sample
                 // carries — guarantees the value columns line up with the
                 // keys we look up below.
                 if (offlineHeadersDeferred && data.values.isNotEmpty()) {
                     offlineHeaders = listOf("timestamp") + data.values.keys.toList()
-                    csvFileWriter?.append(offlineHeaders.joinToString(",") + "\n")
+                    logFileWriter?.append(offlineHeaders.joinToString(",") + "\n")
                     offlineHeadersDeferred = false
                 }
                 val values = offlineHeaders.map { header -> if (header == "timestamp") data.timestamp.toString() else data.values[header]?.toString() ?: "" }
-                csvFileWriter?.append(values.joinToString(",") + "\n")
-                if (++csvWriteCount % csvFlushInterval == 0) {
-                    csvFileWriter?.flush()
+                logFileWriter?.append(values.joinToString(",") + "\n")
+                if (++logWriteCount % logFlushInterval == 0) {
+                    logFileWriter?.flush()
                 }
             } catch (e: IOException) {
                 Log.e("DataRepository", "Error writing to CSV file", e)
@@ -201,7 +303,7 @@ class DataRepository(private val context: Context, private val apiKeyStore: ApiK
         client.newCall(request).execute()
     }
 
-    fun uploadStoredCsvFiles(label: String) {
+    fun uploadStoredLogFiles(label: String) {
         CoroutineScope(Dispatchers.IO).launch {
             val dir = File(context.getExternalFilesDir(null), "sensor_logs")
             if (!dir.exists()) return@launch
@@ -210,6 +312,58 @@ class DataRepository(private val context: Context, private val apiKeyStore: ApiK
                 uploadFile(file, label)
                 file.delete()
             }
+            // SenML logs (JSON or CBOR) are converted to the EI
+            // data-acquisition format at flush time (ingestion doesn't
+            // accept SenML) and deleted only once the upload succeeded.
+            dir.listFiles { f -> f.extension == "senml" || f.extension == "senmlc" }?.forEach { file ->
+                postSenmlAsIngestion(file, label)
+                    .onSuccess {
+                        Log.d("DataRepository", "Successfully uploaded ${file.name}")
+                        file.delete()
+                    }
+                    .onFailure {
+                        Log.e("DataRepository", "SenML upload failed for ${file.name}: ${it.message}")
+                    }
+            }
+        }
+    }
+
+    /**
+     * Convert a SenML log (line-delimited JSON `.senml` or CBOR sequence
+     * `.senmlc`) to the Edge Impulse data-acquisition format and POST it.
+     * A file with zero valid samples fails without upload so callers keep it
+     * on disk (likely corrupt — leave it visible in the Datasets tab rather
+     * than silently destroy data).
+     */
+    private fun postSenmlAsIngestion(file: File, label: String): Result<Unit> {
+        return try {
+            val conversion = if (file.extension == "senmlc") {
+                file.inputStream().buffered().use {
+                    SenmlIngestion.convertPacks(SenmlCbor.decodeAllPacks(it), deviceId)
+                }
+            } else {
+                file.useLines { SenmlIngestion.convert(it, deviceId) }
+            } ?: return Result.failure(IOException("no valid SenML samples in ${file.name}"))
+            if (conversion.skippedLines > 0) {
+                Log.w("DataRepository",
+                    "${file.name}: skipped ${conversion.skippedLines} unparseable SenML line(s)")
+            }
+            val requestBody = IngestionRequest(Protected("v1", "none", "00"), conversion.payload)
+            val request = Request.Builder()
+                .url("https://ingestion.edgeimpulse.com/api/training/data")
+                .header("x-api-key", apiKeyStore.get())
+                .header("x-label", label)
+                .post(gson.toJson(requestBody).toRequestBody("application/json".toMediaType()))
+                .build()
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    Result.failure(IOException("HTTP ${response.code}: ${response.body?.string()}"))
+                } else {
+                    Result.success(Unit)
+                }
+            }
+        } catch (e: IOException) {
+            Result.failure(e)
         }
     }
 
@@ -218,7 +372,7 @@ class DataRepository(private val context: Context, private val apiKeyStore: ApiK
     // share / upload individual files before deciding what to keep).
     // -------------------------------------------------------------------------
 
-    /** Folder where offline-logged CSVs live. Created lazily. */
+    /** Folder where offline-logged datasets (.csv/.senml/.senmlc) live. Created lazily. */
     fun datasetsDir(): File {
         val dir = File(context.getExternalFilesDir(null), "sensor_logs")
         if (!dir.exists()) dir.mkdirs()
@@ -226,23 +380,48 @@ class DataRepository(private val context: Context, private val apiKeyStore: ApiK
     }
 
     /**
-     * List every CSV in the dataset folder along with cheap-to-compute
+     * List every dataset in the folder along with cheap-to-compute
      * metadata (size, sample count = non-header lines, creation time, and the
      * comma-separated headers from line 1). Sample count requires reading the
      * file once so this is O(total bytes) — fine for the modest CSVs the app
      * produces, but call from a background dispatcher.
      */
     fun listStoredDatasets(): List<StoredDataset> {
-        val files = datasetsDir().listFiles { f -> f.extension == "csv" } ?: return emptyList()
+        val files = datasetsDir().listFiles { f ->
+            f.extension == "csv" || f.extension == "senml" || f.extension == "senmlc"
+        } ?: return emptyList()
         return files.sortedByDescending { it.lastModified() }.map { f ->
             var headers: List<String> = emptyList()
             var sampleCount = 0
             try {
-                f.bufferedReader().use { br ->
-                    val first = br.readLine()
-                    if (first != null) {
-                        headers = first.split(',').map { it.trim() }
-                        while (br.readLine() != null) sampleCount++
+                if (f.extension == "senmlc") {
+                    // Every CBOR pack is one sample; channel names come from
+                    // the first pack (best-effort).
+                    f.inputStream().buffered().use { ins ->
+                        for (pack in SenmlCbor.decodeAllPacks(ins)) {
+                            sampleCount++
+                            if (headers.isEmpty()) {
+                                headers = Senml.resolve(pack).map { it.shortName }
+                            }
+                        }
+                    }
+                } else if (f.extension == "senml") {
+                    // Every line is one sample; channel names come from the
+                    // first parseable pack (best-effort).
+                    f.bufferedReader().useLines { lines ->
+                        for (line in lines) {
+                            if (line.isBlank()) continue
+                            sampleCount++
+                            if (headers.isEmpty()) headers = senmlChannelNames(line)
+                        }
+                    }
+                } else {
+                    f.bufferedReader().use { br ->
+                        val first = br.readLine()
+                        if (first != null) {
+                            headers = first.split(',').map { it.trim() }
+                            while (br.readLine() != null) sampleCount++
+                        }
                     }
                 }
             } catch (e: IOException) {
@@ -259,11 +438,48 @@ class DataRepository(private val context: Context, private val apiKeyStore: ApiK
         }
     }
 
-    /** First [maxRows] data rows of a dataset (header excluded), as raw CSV lines. */
+    /** Channel names from one line of a line-delimited SenML log (best-effort). */
+    private fun senmlChannelNames(line: String): List<String> = try {
+        Senml.resolve(Senml.fromJson(line)).map { it.shortName }
+    } catch (e: RuntimeException) {
+        emptyList()
+    }
+
+    /**
+     * First [maxRows] data rows of a dataset, as raw lines. CSV: header row
+     * excluded, headers from line 1. SenML: every line is a data row (raw
+     * JSON, rendered as-is by the preview dialog); headers are the channel
+     * names of the first parseable pack.
+     */
     fun previewDataset(file: File, maxRows: Int = 50): DatasetPreview {
         val rows = mutableListOf<String>()
         var headers = emptyList<String>()
         try {
+            if (file.extension == "senmlc") {
+                // Render each CBOR pack as its JSON form so the raw-line
+                // preview dialog stays readable.
+                file.inputStream().buffered().use { ins ->
+                    for (pack in SenmlCbor.decodeAllPacks(ins)) {
+                        if (headers.isEmpty()) {
+                            headers = Senml.resolve(pack).map { it.shortName }
+                        }
+                        if (rows.size >= maxRows) break
+                        rows.add(Senml.toJson(pack))
+                    }
+                }
+                return DatasetPreview(headers, rows)
+            }
+            if (file.extension == "senml") {
+                file.bufferedReader().useLines { lines ->
+                    for (line in lines) {
+                        if (line.isBlank()) continue
+                        if (headers.isEmpty()) headers = senmlChannelNames(line)
+                        if (rows.size >= maxRows) break
+                        rows.add(line)
+                    }
+                }
+                return DatasetPreview(headers, rows)
+            }
             file.bufferedReader().use { br ->
                 val first = br.readLine() ?: return DatasetPreview(emptyList(), emptyList())
                 headers = first.split(',').map { it.trim() }
@@ -280,16 +496,18 @@ class DataRepository(private val context: Context, private val apiKeyStore: ApiK
     }
 
     /**
-     * Rename a dataset on disk. [newName] may omit the .csv extension; one is
-     * added automatically. Returns the renamed file, or null on failure
-     * (e.g. target already exists, or the file is currently being written to).
+     * Rename a dataset on disk. [newName] may omit the extension; the file's
+     * existing one (.csv / .senml) is preserved. Returns the renamed file, or
+     * null on failure (e.g. target already exists, or the file is currently
+     * being written to).
      */
     fun renameDataset(file: File, newName: String): File? {
         if (isLoggingOffline) return null  // refuse while the writer is open
         val safe = newName.trim()
             .replace(Regex("[^A-Za-z0-9._-]"), "_")
             .takeIf { it.isNotEmpty() } ?: return null
-        val target = File(file.parentFile, if (safe.endsWith(".csv")) safe else "$safe.csv")
+        val ext = file.extension
+        val target = File(file.parentFile, if (safe.endsWith(".$ext")) safe else "$safe.$ext")
         if (target.exists()) return null
         return if (file.renameTo(target)) target else null
     }
@@ -370,6 +588,13 @@ class DataRepository(private val context: Context, private val apiKeyStore: ApiK
      * Reports progress via the returned suspend result.
      */
     suspend fun uploadDataset(file: File, label: String, deleteAfter: Boolean): Result<Unit> {
+        if (file.extension == "senml" || file.extension == "senmlc") {
+            return withContext(Dispatchers.IO) {
+                postSenmlAsIngestion(file, label).onSuccess {
+                    if (deleteAfter) file.delete()
+                }
+            }
+        }
         return try {
             val body = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
@@ -543,8 +768,11 @@ class DataRepository(private val context: Context, private val apiKeyStore: ApiK
             pendingZephyrSensorData.add(samples)
         }
         if (isLoggingOffline) {
-            try {
-                csvFileWriter?.append(samples.joinToString(",") + "\n")
+            if (offlineFormat != OfflineLogFormat.CSV) {
+                appendOfflineSenmlSample(System.currentTimeMillis(),
+                    List(samples.size) { "zephyr_$it" }, samples)
+            } else try {
+                logFileWriter?.append(samples.joinToString(",") + "\n")
             } catch (e: IOException) {
                 Log.e("DataRepository", "CSV write error", e)
             }
@@ -621,16 +849,30 @@ class DataRepository(private val context: Context, private val apiKeyStore: ApiK
     /**
      * Store one USB serial sample. Called continuously by [UsbSerialClient] as
      * data arrives; only buffered when a recording window is open.
+     * [columnNames]/[columnUnits] (from the firmware's `!header` line or its
+     * SenML records) enrich SenML-format offline logs; CSV logging and the
+     * recording buffer ignore them.
      */
-    fun saveUsbSensorData(samples: FloatArray) {
+    fun saveUsbSensorData(
+        samples: FloatArray,
+        columnNames: List<String>? = null,
+        columnUnits: List<String?>? = null,
+    ) {
         if (isUsbRecording) {
             synchronized(pendingUsbSensorData) {
                 pendingUsbSensorData.add(samples)
             }
         }
         if (isLoggingOffline) {
-            try {
-                csvFileWriter?.append(samples.joinToString(",") + "\n")
+            if (offlineFormat != OfflineLogFormat.CSV) {
+                appendOfflineSenmlSample(
+                    System.currentTimeMillis(),
+                    columnNames ?: List(samples.size) { "col_$it" },
+                    samples,
+                    columnUnits,
+                )
+            } else try {
+                logFileWriter?.append(samples.joinToString(",") + "\n")
             } catch (e: IOException) {
                 Log.e("DataRepository", "USB CSV write error", e)
             }

@@ -363,6 +363,7 @@ fun CollectScreen(viewModel: SensorViewModel, cameraHelper: CameraHelper) {
 
     var label      by remember { mutableStateOf("") }
     var offlineOn  by remember { mutableStateOf(false) }
+    var logFormat  by remember { mutableStateOf(OfflineLogFormat.CSV) }
     var statusMsg  by remember { mutableStateOf("") }
     var mode       by remember { mutableIntStateOf(MODE_MULTI) }
 
@@ -724,7 +725,7 @@ fun CollectScreen(viewModel: SensorViewModel, cameraHelper: CameraHelper) {
             }
         }
 
-        // ── Offline CSV switch (shared) ─────────────────────────────────────
+        // ── Offline logging switch + format (shared) ────────────────────────
         item {
             HorizontalDivider()
             Text("Offline logging", style = MaterialTheme.typography.labelLarge,
@@ -739,7 +740,7 @@ fun CollectScreen(viewModel: SensorViewModel, cameraHelper: CameraHelper) {
                         enabled = !forceOffline,
                     )
                     Spacer(Modifier.width(10.dp))
-                    Text("Log samples to CSV on device")
+                    Text("Log samples to file on device")
                 }
                 if (forceOffline && forceReason != null) {
                     Text(
@@ -753,17 +754,49 @@ fun CollectScreen(viewModel: SensorViewModel, cameraHelper: CameraHelper) {
             }
         }
         item {
+            var formatOpen by remember { mutableStateOf(false) }
+            val formatLabels = mapOf(
+                OfflineLogFormat.CSV        to "CSV",
+                OfflineLogFormat.SENML      to "SenML (RFC 8428)",
+                OfflineLogFormat.SENML_CBOR to "SenML CBOR",
+            )
+            ExposedDropdownMenuBox(
+                expanded = formatOpen,
+                onExpandedChange = { if (offlineOn) formatOpen = it },
+            ) {
+                OutlinedTextField(
+                    readOnly      = true,
+                    enabled       = offlineOn,
+                    value         = formatLabels.getValue(logFormat),
+                    onValueChange = {},
+                    label         = { Text("Log format") },
+                    trailingIcon  = { ExposedDropdownMenuDefaults.TrailingIcon(formatOpen) },
+                    modifier      = Modifier.fillMaxWidth().menuAnchor()
+                )
+                ExposedDropdownMenu(
+                    expanded         = formatOpen,
+                    onDismissRequest = { formatOpen = false }
+                ) {
+                    formatLabels.forEach { (format, text) ->
+                        DropdownMenuItem(text = { Text(text) }, onClick = {
+                            logFormat = format; formatOpen = false
+                        })
+                    }
+                }
+            }
+        }
+        item {
             OutlinedButton(
                 modifier = Modifier.fillMaxWidth(),
                 enabled  = label.isNotBlank(),
                 onClick  = {
-                    viewModel.uploadStoredCsvFiles(label)
-                    statusMsg = "Uploading CSV files with label ‘$label’…"
+                    viewModel.uploadStoredLogFiles(label)
+                    statusMsg = "Uploading stored files with label ‘$label’…"
                 }
             ) {
                 Icon(Icons.Default.Upload, contentDescription = null)
                 Spacer(Modifier.width(6.dp))
-                Text("Upload stored CSV to Edge Impulse")
+                Text("Upload stored data to Edge Impulse")
             }
         }
 
@@ -783,7 +816,7 @@ fun CollectScreen(viewModel: SensorViewModel, cameraHelper: CameraHelper) {
                     enabled  = canStart,
                     onClick  = {
                         viewModel.lastLabel = label
-                        if (offlineOn) viewModel.startOfflineLogging()
+                        if (offlineOn) viewModel.startOfflineLogging(format = logFormat)
                         viewModel.startUnifiedRecording(
                             durationMs          = effectiveDurationSec * 1000L,
                             label               = label.trim(),
@@ -817,7 +850,7 @@ fun CollectScreen(viewModel: SensorViewModel, cameraHelper: CameraHelper) {
                                     return@Button
                                 }
                             }
-                            if (offlineOn) viewModel.startOfflineLogging()
+                            if (offlineOn) viewModel.startOfflineLogging(format = logFormat)
                             viewModel.startSensorForDuration(
                                 selectedSensor,
                                 effectiveDurationSec * 1000L
